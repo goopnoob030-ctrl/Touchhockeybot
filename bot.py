@@ -326,4 +326,5 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 app.run_polling()
 
 if name == "main":
-main()
+main()if __name__ == "__main__":
+    main()
