@@ -156,17 +156,27 @@ def username_text(user):
     return f"@{user.username}" if user.username else f"ID: {user.id}"
 
 
-def main_menu():
-    return InlineKeyboardMarkup([
+def main_menu(user_id):
+    # Показываем управление только фактическому владельцу клуба.
+    with lock:
+        owns_club = db.execute(
+            "SELECT 1 FROM clubs WHERE owner_id=? LIMIT 1", (user_id,)
+        ).fetchone() is not None
+
+    rows = [
         [InlineKeyboardButton("🏒 Взять клуб", callback_data="clubs")],
         [InlineKeyboardButton("🔎 Искать клуб", callback_data="search")],
         [InlineKeyboardButton("📢 Объявления", callback_data="ads")],
-        [InlineKeyboardButton("⚙️ Управление клубом", callback_data="management")],
+    ]
+    if owns_club:
+        rows.append([InlineKeyboardButton("⚙️ Управление клубом", callback_data="management")])
+    rows.extend([
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
         [InlineKeyboardButton("⭐ Донат", callback_data="donate")],
         [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton("👑 Админ-панель", callback_data="admin")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 async def send_to_admin_group(context, text, keyboard):
@@ -230,7 +240,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🏒 TOUCH HOCKEY TM\n\nДобро пожаловать!\n"
         "Изменить ник и позицию можно в разделе «Настройки».",
-        reply_markup=main_menu()
+        reply_markup=main_menu(update.effective_user.id)
     )
 
 
@@ -258,7 +268,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player = get_player(uid)
 
     if data == "home":
-        await q.edit_message_text("🏒 Главное меню", reply_markup=main_menu())
+        await q.edit_message_text("🏒 Главное меню", reply_markup=main_menu(uid))
 
     elif data == "clubs":
         with lock:
