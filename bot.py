@@ -7,7 +7,7 @@ MessageHandler, ContextTypes, filters
 )
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [123456789]  # Замени на Telegram ID администраторов
+ADMIN_IDS = [8695966053]   # Замени на Telegram ID администраторов
 
 db = sqlite3.connect("touchhockey.db", check_same_thread=False)
 db.execute("""
