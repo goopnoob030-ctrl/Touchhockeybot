@@ -14,7 +14,10 @@
     "last_active_at": "2026-11-05 07:00:23.387000",
     "start_time": "2026-11-05 07:00:23.387000"
   },
-  "commands": [
+  "commands": [/start
+/profile
+/top
+/rules
     {
       "bot": "34476366",
       "command": "!",
