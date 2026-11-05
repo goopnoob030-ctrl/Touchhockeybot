@@ -4,6 +4,8 @@ import json
 import time
 import sqlite3
 import threading
+import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from telegram import (
@@ -56,7 +58,11 @@ def init_db():
             nick_changed_at REAL DEFAULT 0,
             pos_changed_at REAL DEFAULT 0,
             search_used_at REAL DEFAULT 0,
-            take_used_at REAL DEFAULT 0
+            take_used_at REAL DEFAULT 0,
+            career_status TEXT DEFAULT 'active',
+            registration_status TEXT DEFAULT 'unregistered',
+            roblox_username TEXT,
+            roblox_id INTEGER
         );
         CREATE TABLE IF NOT EXISTS clubs (
             name TEXT PRIMARY KEY,
@@ -93,6 +99,10 @@ def init_db():
             ("players", "pos_changed_at", "REAL DEFAULT 0"),
             ("players", "search_used_at", "REAL DEFAULT 0"),
             ("players", "take_used_at", "REAL DEFAULT 0"),
+            ("players", "career_status", "TEXT DEFAULT 'active'"),
+            ("players", "registration_status", "TEXT DEFAULT 'unregistered'"),
+            ("players", "roblox_username", "TEXT"),
+            ("players", "roblox_id", "INTEGER"),
             ("clubs", "closed", "INTEGER DEFAULT 0"),
         ]:
             columns = [r["name"] for r in db.execute(f"PRAGMA table_info({table})")]
@@ -150,6 +160,35 @@ def ensure_player(user):
             (user.username, user.id)
         )
         db.commit()
+
+
+def is_registered(user_id):
+    if is_admin(user_id):
+        return True
+    p = get_player(user_id)
+    return bool(p and p["registration_status"] == "approved")
+
+
+def is_club_owner(user_id):
+    with lock:
+        return db.execute("SELECT 1 FROM clubs WHERE owner_id=? LIMIT 1", (user_id,)).fetchone() is not None
+
+
+def lookup_roblox_user(username):
+    """Resolve a Roblox username through Roblox's public users API."""
+    body = json.dumps({"usernames": [username], "excludeBannedUsers": False}).encode("utf-8")
+    request = urllib.request.Request(
+        "https://users.roblox.com/v1/usernames/users", data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        users = result.get("data", [])
+        return users[0] if users else None
+    except Exception:
+        return None
 
 
 def username_text(user):
@@ -237,10 +276,23 @@ def fmt_time(seconds):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_player(update.effective_user)
+    uid = update.effective_user.id
+    if not is_registered(uid):
+        p = get_player(uid)
+        if p["registration_status"] == "pending":
+            await update.message.reply_text("⏳ Твоя регистрация Roblox уже отправлена администраторам. Дождись проверки.")
+        else:
+            context.user_data["flow"] = "roblox_registration"
+            await update.message.reply_text(
+                "📝 РЕГИСТРАЦИЯ\n\n"
+                "Перед использованием бота нужно подтвердить Roblox-аккаунт.\n"
+                "Отправь свой точный Roblox username (не отображаемое имя)."
+            )
+        return
     await update.message.reply_text(
         "🏒 TOUCH HOCKEY TM\n\nДобро пожаловать!\n"
         "Изменить ник и позицию можно в разделе «Настройки».",
-        reply_markup=main_menu(update.effective_user.id)
+        reply_markup=main_menu(uid)
     )
 
 
@@ -266,6 +318,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     ensure_player(q.from_user)
     player = get_player(uid)
+    if not is_registered(uid) and not data.startswith("mod_"):
+        await q.edit_message_text("⛔ Сначала пройди регистрацию Roblox. Напиши /start.")
+        return
 
     if data == "home":
         await q.edit_message_text("🏒 Главное меню", reply_markup=main_menu(uid))
@@ -357,13 +412,14 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "ad_players":
-        if not player["club"]:
-            await q.edit_message_text("❌ Искать игроков могут только игроки с клубом.")
+        owner_club = db.execute("SELECT name FROM clubs WHERE owner_id=?", (uid,)).fetchone()
+        if not owner_club:
+            await q.edit_message_text("❌ Создавать объявление «Поиск игроков» могут только владельцы клубов.")
             return
         context.user_data["flow"] = "player_ad"
         await q.edit_message_text(
             f"🏒 ПОИСК ИГРОКОВ\n\nОтправь текст объявления. "
-            f"Бот добавит в начало название клуба «{player['club']}», "
+            f"Бот добавит в начало название клуба «{owner_club['name']}», "
             f"а в конец — твой контакт {username_text(q.from_user)}."
         )
 
@@ -478,13 +534,53 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "profile":
         p = get_player(uid)
+        career = p["career_status"] or "active"
+        career_label = "Завершена" if career == "retired" else "Активна"
+        career_button = ("↩️ Вернуться в карьеру" if career == "retired"
+                         else "🏁 Завершить карьеру")
+        career_callback = "career_return_confirm" if career == "retired" else "career_retire_confirm"
         await q.edit_message_text(
             f"👤 ПРОФИЛЬ\n\nНик: {p['nickname'] or 'Не указан'}\n"
             f"Контакт: {username_text(q.from_user)}\n"
             f"Позиция: {p['position'] or 'Не указана'}\n"
-            f"Клуб: {p['club'] or 'Свободный агент'}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="home")]])
+            f"Клуб: {p['club'] or 'Свободный агент'}\n"
+            f"Карьера: {career_label}\n"
+            f"Roblox: {p['roblox_username'] or 'Не привязан'}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(career_button, callback_data=career_callback)],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="home")]
+            ])
         )
+
+    elif data == "career_retire_confirm":
+        await q.edit_message_text(
+            "🏁 Завершить карьеру?\n\nТвой профиль останется в боте, но статус станет «Завершена».",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, завершить", callback_data="career_retire")],
+                [InlineKeyboardButton("↩️ Отмена", callback_data="profile")]
+            ])
+        )
+
+    elif data == "career_return_confirm":
+        await q.edit_message_text(
+            "↩️ Вернуться в карьеру?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, вернуться", callback_data="career_return")],
+                [InlineKeyboardButton("↩️ Отмена", callback_data="profile")]
+            ])
+        )
+
+    elif data == "career_retire":
+        with lock:
+            db.execute("UPDATE players SET career_status='retired' WHERE user_id=?", (uid,))
+            db.commit()
+        await q.edit_message_text("🏁 Карьера завершена.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 Профиль", callback_data="profile")]]))
+
+    elif data == "career_return":
+        with lock:
+            db.execute("UPDATE players SET career_status='active' WHERE user_id=?", (uid,))
+            db.commit()
+        await q.edit_message_text("✅ Ты вернулся в карьеру!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 Профиль", callback_data="profile")]]))
 
     elif data == "donate":
         keyboard = [
@@ -613,7 +709,15 @@ async def moderate_request(q, context, request_id, approve):
         kind = req["kind"]
         user_id = req["user_id"]
 
-        if approve and kind == "take_club":
+        if approve and kind == "roblox_registration":
+            db.execute(
+                "UPDATE players SET registration_status='approved',roblox_username=?,roblox_id=? WHERE user_id=?",
+                (payload.get("roblox_username"), payload.get("roblox_id"), user_id)
+            )
+        elif not approve and kind == "roblox_registration":
+            db.execute("UPDATE players SET registration_status='rejected' WHERE user_id=?", (user_id,))
+
+        elif approve and kind == "take_club":
             club = payload["club"]
             c = db.execute("SELECT owner_id,closed FROM clubs WHERE name=?", (club,)).fetchone()
             p = db.execute("SELECT club FROM players WHERE user_id=?", (user_id,)).fetchone()
@@ -717,7 +821,9 @@ async def moderate_request(q, context, request_id, approve):
             return
 
     try:
-        if kind == "take_club":
+        if kind == "roblox_registration":
+            message = "✅ Регистрация Roblox подтверждена! Напиши /start, чтобы открыть меню." if approve else "❌ Регистрация отклонена. Напиши /start и попробуй отправить Roblox username ещё раз."
+        elif kind == "take_club":
             message = "🎉 Твоя заявка одобрена! Клуб закреплён за тобой." if approve else "❌ Заявка на клуб отклонена."
         elif kind == "transfer":
             message = "✅ Трансфер одобрен администраторами." if approve else "❌ Трансфер отклонён администраторами."
@@ -761,7 +867,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     p = get_player(uid)
 
-    if flow == "free_agent":
+    if flow == "roblox_registration":
+        username = text.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,20}", username):
+            await update.message.reply_text("❌ Введи Roblox username: 3–20 символов, только латинские буквы, цифры и _. Попробуй ещё раз.")
+            return
+        await update.message.reply_text("🔎 Проверяю Roblox-профиль, подожди...")
+        roblox_user = lookup_roblox_user(username)
+        if not roblox_user:
+            await update.message.reply_text("❌ Не удалось найти аккаунт Roblox или сервис временно недоступен. Проверь username и отправь его снова.")
+            return
+        rid = await create_request(
+            context, uid, "roblox_registration",
+            {"roblox_username": roblox_user.get("name", username), "roblox_id": roblox_user.get("id")},
+            f"📝 РЕГИСТРАЦИЯ ROBLOX\nИгрок Telegram: {username_text(update.effective_user)}\n"
+            f"Roblox username: {roblox_user.get('name', username)}\nRoblox ID: {roblox_user.get('id')}"
+        )
+        if rid:
+            with lock:
+                db.execute("UPDATE players SET registration_status='pending' WHERE user_id=?", (uid,))
+                db.commit()
+            context.user_data.pop("flow", None)
+            await update.message.reply_text("✅ Roblox-профиль найден! Заявка отправлена администраторам. После одобрения откроется меню бота.")
+        else:
+            await update.message.reply_text("❌ Не удалось отправить заявку. Администраторская группа не подключена.")
+    elif flow == "free_agent":
         context.user_data.pop("flow", None)
         if len(text) > 800:
             await update.message.reply_text("❌ Максимум 800 символов.")
@@ -790,13 +920,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Отправлено на проверку." if rid else "❌ Не удалось отправить. Проверь группу.")
     elif flow == "player_ad":
         context.user_data.pop("flow", None)
+        owner_club = db.execute("SELECT name FROM clubs WHERE owner_id=?", (uid,)).fetchone()
+        if not owner_club:
+            await update.message.reply_text("❌ Только владелец клуба может отправлять объявление «Поиск игроков».")
+            return
         if len(text) > 800:
             await update.message.reply_text("❌ Максимум 800 символов.")
             return
-        if not p["club"]:
-            await update.message.reply_text("❌ У тебя больше нет клуба.")
-            return
-        post = f"🏒 {p['club']}\n\n{text}\n\n📩: {username_text(update.effective_user)}"
+        post = f"🏒 {owner_club['name']}\n\n{text}\n\n📩: {username_text(update.effective_user)}"
         rid = await create_request(context, uid, "player_ad", {"text": post}, f"🏒 ПОИСК ИГРОКОВ\n\n{post}")
         await update.message.reply_text("✅ Объявление отправлено на проверку." if rid else "❌ Не удалось отправить. Проверь группу.")
     elif flow == "nickname":
